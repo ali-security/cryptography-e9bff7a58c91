@@ -25,7 +25,7 @@ use once_cell::sync::Lazy;
 use crate::ops::CryptoOps;
 use crate::policy::extension::{ca, common, ee, Criticality, ExtensionPolicy, ExtensionValidator};
 use crate::types::{DNSName, DNSPattern, IPAddress};
-use crate::{ValidationError, VerificationCertificate};
+use crate::{Budget, ValidationError, VerificationCertificate};
 
 // SubjectPublicKeyInfo AlgorithmIdentifier constants, as defined in CA/B 7.1.3.1.
 
@@ -463,6 +463,7 @@ impl<'a, B: CryptoOps> Policy<'a, B> {
         child: &Certificate<'_>,
         current_depth: u8,
         issuer_extensions: &Extensions<'_>,
+        budget: &mut Budget,
     ) -> Result<(), ValidationError> {
         // The issuer needs to be a valid CA at the current depth.
         self.permits_ca(issuer.certificate(), current_depth, issuer_extensions)?;
@@ -499,6 +500,11 @@ impl<'a, B: CryptoOps> Policy<'a, B> {
         let pk = issuer
             .public_key(&self.ops)
             .map_err(|_| ValidationError::Other("issuer has malformed public key".to_string()))?;
+
+        // Charge the (potentially expensive) signature verification against the
+        // budget before performing it, bounding the total work an attacker can
+        // force during chain building.
+        budget.signature_check()?;
         if self.ops.verify_signed_by(child, pk).is_err() {
             return Err(ValidationError::Other(
                 "signature does not match".to_string(),

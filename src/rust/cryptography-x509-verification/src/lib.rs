@@ -15,9 +15,12 @@ use std::vec;
 
 use cryptography_x509::extensions::{DuplicateExtensionsError, Extensions};
 use cryptography_x509::{
-    extensions::{NameConstraints, SubjectAlternativeName},
+    extensions::{AuthorityKeyIdentifier, NameConstraints, SubjectAlternativeName},
     name::GeneralName,
-    oid::{NAME_CONSTRAINTS_OID, SUBJECT_ALTERNATIVE_NAME_OID},
+    oid::{
+        AUTHORITY_KEY_IDENTIFIER_OID, NAME_CONSTRAINTS_OID, SUBJECT_ALTERNATIVE_NAME_OID,
+        SUBJECT_KEY_IDENTIFIER_OID,
+    },
 };
 
 use crate::certificate::cert_is_self_issued;
@@ -39,15 +42,23 @@ pub enum ValidationError {
 
 struct Budget {
     name_constraint_checks: usize,
+    signature_checks: usize,
 }
 
 impl Budget {
-    // Same limit as other validators
+    // The maximum number of name constraint checks performed when attempting
+    // path construction. This is the same limit as other validators.
     const DEFAULT_NAME_CONSTRAINT_CHECK_LIMIT: usize = 1 << 20;
+
+    // The maximum number of signature verifications performed when attempting
+    // path construction. The is similar to other validators:
+    // both Go and rustls-webpki pick 100.
+    const DEFAULT_SIGNATURE_CHECK_LIMIT: usize = 1 << 7;
 
     fn new() -> Budget {
         Budget {
             name_constraint_checks: Self::DEFAULT_NAME_CONSTRAINT_CHECK_LIMIT,
+            signature_checks: Self::DEFAULT_SIGNATURE_CHECK_LIMIT,
         }
     }
 
@@ -57,6 +68,16 @@ impl Budget {
                 .checked_sub(1)
                 .ok_or(ValidationError::FatalError(
                     "Exceeded maximum name constraint check limit",
+                ))?;
+        Ok(())
+    }
+
+    fn signature_check(&mut self) -> Result<(), ValidationError> {
+        self.signature_checks =
+            self.signature_checks
+                .checked_sub(1)
+                .ok_or(ValidationError::FatalError(
+                    "Exceeded maximum signature check limit",
                 ))?;
         Ok(())
     }
@@ -238,18 +259,57 @@ impl<'a, 'chain, B: CryptoOps> ChainBuilder<'a, 'chain, B> {
         }
     }
 
+    /// Identify and return potential issuers for `cert`, considering
+    /// candidates from both the trusted store and untrusted intermediate set.
+    /// Trusted candidates are returned before untrusted intermediate
+    /// candidates, and both groups are opportunisitically ordered by
+    /// "likeliness" in terms of AKI/SKI match.
     fn potential_issuers(
         &'a self,
         cert: &'a VerificationCertificate<'chain, B>,
-    ) -> impl Iterator<Item = &'a VerificationCertificate<'chain, B>> + '_ {
-        // TODO: Optimizations:
-        // * Search by AKI and other identifiers?
-        self.store
+        cert_extensions: &Extensions<'chain>,
+    ) -> Vec<&'a VerificationCertificate<'chain, B>> {
+        let mut candidates: Vec<&'a VerificationCertificate<'chain, B>> = self
+            .store
             .get_by_subject(&cert.certificate().tbs_cert.issuer)
             .iter()
             .chain(self.intermediates.iter().filter(|&candidate| {
                 candidate.certificate().subject() == cert.certificate().issuer()
             }))
+            .collect();
+
+        let want_kid: Option<&[u8]> = cert_extensions
+            .get_extension(&AUTHORITY_KEY_IDENTIFIER_OID)
+            .and_then(|ext| ext.value::<AuthorityKeyIdentifier<'_>>().ok())
+            .and_then(|aki| aki.key_identifier);
+
+        // This mirrors Go's `findPotentialParents`: we have a global
+        // signature budget, so we want to bucket candidates by likeliness
+        // to avoid wasting budget on (potentially adversarial) name collisions.
+        //
+        // Observe that we use a stable sort to preserve trusted candidates
+        // before untrusted candidates in each likeliness bucket. In other
+        // words, we always try a likely trusted candidate over an equally
+        // likely untrusted one.
+        //
+        // See: <https://github.com/golang/go/blob/d00c67f297e/src/crypto/x509/cert_pool.go#L136>
+        candidates.sort_by_key(|candidate| {
+            let have_kid: Option<&[u8]> =
+                candidate.certificate().extensions().ok().and_then(|exts| {
+                    exts.get_extension(&SUBJECT_KEY_IDENTIFIER_OID)
+                        .and_then(|ext| ext.value::<&[u8]>().ok())
+                });
+
+            match (want_kid, have_kid) {
+                // cert AKID matches candidate SKID, highest likelihood.
+                (Some(want), Some(have)) if want == have => 0,
+                // cert AKID and candidate SKID don't match, lowest likelihood.
+                (Some(_), Some(_)) => 2,
+                // cert AKID and/or candidate SKID is not present, medium likelihood.
+                _ => 1u8,
+            }
+        });
+        candidates
     }
 
     fn build_chain_inner(
@@ -282,7 +342,8 @@ impl<'a, 'chain, B: CryptoOps> ChainBuilder<'a, 'chain, B> {
         // Otherwise, we collect a list of potential issuers for this cert,
         // and continue with the first that verifies.
         let mut last_err: Option<ValidationError> = None;
-        for issuing_cert_candidate in self.potential_issuers(working_cert) {
+        for issuing_cert_candidate in self.potential_issuers(working_cert, working_cert_extensions)
+        {
             // A candidate issuer is said to verify if it both
             // signs for the working certificate and conforms to the
             // policy.
@@ -292,6 +353,7 @@ impl<'a, 'chain, B: CryptoOps> ChainBuilder<'a, 'chain, B> {
                 working_cert.certificate(),
                 current_depth,
                 &issuer_extensions,
+                budget,
             ) {
                 Ok(_) => {
                     match self.build_chain_inner(
@@ -383,5 +445,109 @@ impl<'a, 'chain, B: CryptoOps> ChainBuilder<'a, 'chain, B> {
         // We build the chain in reverse order, fix it now.
         chain.reverse();
         Ok(chain)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cryptography_x509::certificate::Certificate;
+
+    use crate::ops::{CryptoOps, VerificationCertificate};
+    use crate::policy::{Policy, Subject};
+    use crate::trust_store::Store;
+    use crate::types::DNSName;
+    use crate::{Budget, ChainBuilder, NameChain, ValidationError};
+
+    /// A `CryptoOps` whose public key extraction and signature verification
+    /// always succeed, so that `valid_issuer` can be driven to completion
+    /// without real cryptographic material.
+    struct NullOps;
+
+    impl CryptoOps for NullOps {
+        type Key = ();
+        type Err = ();
+        type CertificateExtra = ();
+
+        fn public_key(&self, _cert: &Certificate<'_>) -> Result<Self::Key, Self::Err> {
+            Ok(())
+        }
+
+        fn verify_signed_by(
+            &self,
+            _cert: &Certificate<'_>,
+            _key: &Self::Key,
+        ) -> Result<(), Self::Err> {
+            Ok(())
+        }
+    }
+
+    // A self-issued ("looping") CA certificate that is its own issuer.
+    fn looping_ca_pem() -> pem::Pem {
+        pem::parse(
+            "-----BEGIN CERTIFICATE-----
+MIIBcjCCARmgAwIBAgIBATAKBggqhkjOPQQDAjAhMR8wHQYDVQQDDBZsb29waW5n
+IHNlbGYtc2lnbmVkIENBMB4XDTIzMTIzMTAwMDAwMFoXDTI0MDEzMTAwMDAwMFow
+ITEfMB0GA1UEAwwWbG9vcGluZyBzZWxmLXNpZ25lZCBDQTBZMBMGByqGSM49AgEG
+CCqGSM49AwEHA0IABKAoXUGnHdfXJbSXjRjeW+PCVHmlo4KEki69N5pJUA0QyQMR
+v9ySOMnWf3Ea7TR4g3zdguwTP7LdpSku3uR1QkmjQjBAMA8GA1UdEwEB/wQFMAMB
+Af8wDgYDVR0PAQH/BAQDAgGGMB0GA1UdDgQWBBR23MGdG1Ma9iR+3CxKTafD/OE0
+dTAKBggqhkjOPQQDAgNHADBEAiA4RCr07KfZdM16VfGNZAQFjvC60SWIU3RRVY/L
+qolIOwIgCaIgj9ipK0Q0p+45UJiq+L/ncrxsweJkFq/UYubzhX0=
+-----END CERTIFICATE-----",
+        )
+        .unwrap()
+    }
+
+    /// Exercises our pathlen overflow error scenario.
+    ///
+    /// This condition is logically unreachable from Python, since
+    /// we unconditionally limit signature checks to a number smaller
+    /// than `u8::MAX`, meaning that we always exhaust the signature budget
+    /// before potentially exhausting the pathlen budget.
+    ///
+    /// To test that directly, we manually lift the signature budget
+    /// and start our pathlen state right at `u8::MAX`, guaranteeing
+    /// an overflow on the immediate chain building step.
+    #[test]
+    fn test_build_chain_inner_depth_overflow() {
+        let pem = looping_ca_pem();
+        let ca = asn1::parse_single::<Certificate<'_>>(pem.contents()).unwrap();
+        let ca_exts = ca.extensions().ok().unwrap();
+
+        // The same self-issued CA is both the working certificate and its own
+        // (only) candidate issuer, so the search recurses on itself.
+        let working = VerificationCertificate::<'_, NullOps>::new(ca.clone(), ());
+        let intermediates = vec![VerificationCertificate::<'_, NullOps>::new(ca.clone(), ())];
+        let store: Store<'_, NullOps> = Store::new([]);
+
+        let subject = Subject::DNS(DNSName::new("example.com").unwrap());
+        let time = asn1::DateTime::new(2024, 1, 1, 0, 0, 0).unwrap();
+        let policy = Policy::new(NullOps, subject, time, Some(u8::MAX));
+
+        let builder = ChainBuilder::new(intermediates, &policy, &store);
+        let mut budget = Budget {
+            name_constraint_checks: usize::MAX,
+            signature_checks: usize::MAX,
+        };
+
+        let name_chain = NameChain::new(None, &ca_exts, false).ok().unwrap();
+        // NOTE: `Result::unwrap_err` would require `Chain` (and therefore
+        // `VerificationCertificate`) to be `Debug`, which it isn't.
+        let err = match builder.build_chain_inner(
+            &working,
+            u8::MAX,
+            &ca_exts,
+            name_chain,
+            &mut budget,
+        ) {
+            Ok(_) => panic!("chain building unexpectedly succeeded"),
+            Err(e) => e,
+        };
+
+        assert!(matches!(
+            err,
+            ValidationError::Other(ref msg)
+                if msg.contains("current depth calculation overflowed")
+        ));
     }
 }
