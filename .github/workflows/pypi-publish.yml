@@ -11,9 +11,6 @@ on:
         required: true
         type: choice
         options: ["testpypi", "pypi"]
-  workflow_run:
-    workflows: ["Wheel Builder"]
-    types: [completed]
 
 env:
   PUBLISH_REQUIREMENTS_PATH: .github/requirements/publish-requirements.txt

@@ -1,12 +1,6 @@
 name: linkcheck
 on:
-  pull_request:
-    paths:
-      - docs/conf.py
-      - .github/workflows/linkcheck.yml
-  push:
-    branches:
-      - main
+  workflow_dispatch: {}
 
 permissions:
   contents: read

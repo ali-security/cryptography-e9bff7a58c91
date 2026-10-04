@@ -1,10 +1,6 @@
 name: Benchmark
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/benchmark.yml'
-      - 'src/**'
-      - 'tests/**'
+  workflow_dispatch: {}
 
 permissions:
   contents: read

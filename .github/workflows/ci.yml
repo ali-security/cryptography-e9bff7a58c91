@@ -1,13 +1,6 @@
 name: CI
 on:
-  pull_request: {}
-  push:
-    branches:
-      - main
-      - '*.*.x'
-    tags:
-      - '*.*'
-      - '*.*.*'
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -222,7 +215,7 @@ jobs:
       fail-fast: false
       matrix:
         RUNNER:
-          - {OS: 'macos-13', ARCH: 'x86_64'}
+          - {OS: 'macos-latest', ARCH: 'x86_64'}
           - {OS: 'macos-14', ARCH: 'arm64'}
         PYTHON:
           - {VERSION: "3.7", NOXSESSION: "tests-nocoverage"}
