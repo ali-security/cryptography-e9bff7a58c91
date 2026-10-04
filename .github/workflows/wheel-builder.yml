@@ -95,6 +95,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
+      - uses: actions/download-artifact@v4
+        with:
+          name: openssl-sealed-src
+          path: /tmp/seal-ossl
+      - name: Build sealed OpenSSL 3.2.2+sp1
+        # The wheels this workflow publishes statically link the OpenSSL built
+        # below, so the suite is run against that same library rather than the
+        # runner's system libssl; otherwise the only full pytest run here would
+        # exercise an OpenSSL the shipped wheels never contain. This is Seal's
+        # sealed openssl-3.2.2+sp1 source (derived in the sdist job: pristine
+        # 3.2.2 + 18 CVE backports, incl. CVE-2024-12797 and CVE-2026-45447).
+        run: |
+          set -ex
+          mkdir -p /tmp/openssl-src
+          tar zxf /tmp/seal-ossl/openssl-sealed-src.tar.gz -C /tmp/openssl-src
+          cd /tmp/openssl-src
+          ./config no-shared no-tests -fPIC --prefix=/tmp/ossl
+          make -j4
+          make install_sw
       - name: Install Python dependencies
         run: |
           python -m pip install -U pip
@@ -104,6 +123,14 @@ jobs:
         run: python -m pip install --no-build-isolation ./vectors
       - name: Install cryptography
         run: python -m pip install --no-build-isolation .
+        env:
+          OPENSSL_DIR: /tmp/ossl
+          OPENSSL_STATIC: 1
+      - name: Print the OpenSSL we built and linked against
+        # Gates the suite: it is only evidence for the bundled OpenSSL if it
+        # really linked the sealed OpenSSL built above.
+        run: |
+          python -c "from cryptography.hazmat.backends.openssl.backend import backend;print('Loaded: ' + backend.openssl_version_text());print('Linked Against: ' + backend._ffi.string(backend._lib.OPENSSL_VERSION_TEXT).decode('ascii'))"
       - name: Run the test suite
         run: python -m pytest tests/
 
@@ -769,3 +796,118 @@ jobs:
           name: "cryptography-wheel-${{ matrix.WINDOWS.WINDOWS }}-${{ matrix.PYTHON.VERSION }}-${{ matrix.PYTHON.ABI_VERSION }}"
           path: wheelhouse/*.whl
           if-no-files-found: error
+
+  tests-macos:
+    needs: [sdist]
+    runs-on: macos-latest
+    timeout-minutes: 90
+    name: "Tests (macOS CPython 3.11)"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.version || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin
+      - uses: actions/download-artifact@v4
+        with:
+          name: openssl-sealed-src
+          path: seal-ossl
+      - name: Build sealed OpenSSL 3.2.2+sp1
+        # macos-latest is arm64; build a native arm64 static build of Seal's
+        # sealed openssl-3.2.2+sp1 source (derived in the sdist job) and run the
+        # suite against it so the macOS test leg exercises the same bundled
+        # OpenSSL the shipped macOS wheels statically link.
+        run: |
+          set -ex
+          mkdir -p openssl-src
+          tar zxf seal-ossl/openssl-sealed-src.tar.gz -C openssl-src
+          cd openssl-src
+          ./Configure darwin64-arm64-cc no-shared no-tests --prefix=/tmp/ossl
+          make -j3
+          make install_sw
+      - name: Install Python dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install "wheel==0.42.0" build flit_core "setuptools-rust>=1.7.0" \
+            "cffi>=1.12" "pytest>=6.2.0" pytest-benchmark pytest-cov pytest-xdist pretend certifi
+      - name: Install the test vectors
+        run: python -m pip install --no-build-isolation ./vectors
+      - name: Install cryptography
+        run: python -m pip install --no-build-isolation .
+        env:
+          OPENSSL_DIR: /tmp/ossl
+          OPENSSL_STATIC: 1
+      - name: Print the OpenSSL we built and linked against
+        run: |
+          python -c "from cryptography.hazmat.backends.openssl.backend import backend;print('Loaded: ' + backend.openssl_version_text());print('Linked Against: ' + backend._ffi.string(backend._lib.OPENSSL_VERSION_TEXT).decode('ascii'))"
+      - name: Run the test suite
+        run: python -m pytest tests/
+
+  tests-windows:
+    needs: [sdist]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    name: "Tests (Windows CPython 3.11)"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.version || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8
+        with:
+          toolchain: 1.77.2
+          target: x86_64-pc-windows-msvc
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: openssl-sealed-src
+          path: seal-ossl
+      - name: Build sealed OpenSSL 3.2.2+sp1
+        # Build the same win64 static build of Seal's sealed openssl-3.2.2+sp1
+        # source (derived in the sdist job) the shipped Windows wheels link, so
+        # the Windows test leg exercises the bundled library.
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path openssl-src | Out-Null
+          tar zxf seal-ossl/openssl-sealed-src.tar.gz -C openssl-src
+          cd openssl-src
+          perl Configure VC-WIN64A no-shared no-tests --prefix=C:/openssl-win64 --openssldir=C:/openssl-win64/ssl
+          nmake build_sw
+          nmake install_sw
+      - name: Configure OpenSSL
+        run: |
+            echo "OPENSSL_DIR=C:/openssl-win64" >> $GITHUB_ENV
+            echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
+        shell: bash
+      - name: Install Python dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install "wheel==0.42.0" build flit_core "setuptools-rust>=1.7.0" "cffi>=1.12" "pytest>=6.2.0" pytest-benchmark pytest-cov pytest-xdist pretend certifi
+      - name: Install the test vectors
+        run: python -m pip install --no-build-isolation ./vectors
+      - name: Install cryptography
+        # Git-bash's coreutils `link` shadows MSVC's link.exe.
+        run: |
+          rm -f /usr/bin/link /usr/bin/link.exe
+          python -m pip install --no-build-isolation .
+        shell: bash
+        env:
+          OPENSSL_DIR: C:/openssl-win64
+          OPENSSL_STATIC: 1
+      - name: Print the OpenSSL we built and linked against
+        run: |
+            python -c "from cryptography.hazmat.backends.openssl.backend import backend;print('Loaded: ' + backend.openssl_version_text());print('Linked Against: ' + backend._ffi.string(backend._lib.OPENSSL_VERSION_TEXT).decode('ascii'))"
+      - name: Run the test suite
+        run: python -m pytest tests/
